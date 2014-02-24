@@ -1,0 +1,192 @@
+#!/usr/bin/env ruby
+require 'apipie_bindings'
+require 'facter'
+require 'json'
+require 'uri'
+require 'net/http'
+require 'net/https'
+require 'fileutils'
+
+$uri = nil
+$username = nil
+$password = nil
+$environment = nil
+$puppetmaster = nil
+$puppetca = nil
+$conf_path = '/etc/puppet/puppet.conf'
+$redeploy = false
+$dryrun = false
+$verbose = false
+$trace = false
+$batch = false
+$name = nil
+$mac = nil
+
+def info(s)
+  $stderr.puts(s) if $verbose
+end
+
+def fatal(s, code = 1)
+  $stderr.puts(s)
+  exit(code)
+end
+
+def usage(s = nil)
+  $stderr.puts(s) if s
+  $stderr.puts <<"EOUSAGE"
+Registers node in Foreman and deploys puppet configuration.
+
+Usage: #{File.basename($0)} -i URI
+
+  -i --uri              Foreman instance URI (e.g. https://foreman.local.lan)
+  -u --username         Username to use for registration
+  -p --password         Password to use for registration
+  -e --environment      Puppet environment
+  -a --puppet-master    Puppet master server
+  -c --puppet-ca        Puppet certificate authority server
+                        (above is required)
+
+     --puppet-path      Path to config (default /etc/puppet/puppet.conf)
+     --force-hostname   Override FQDN with given one
+     --force-mac        Override MAC address with given one
+     --redeploy         Skip registration in Foreman and only redeploy puppet
+     --trace            Print full exception backtrace on error
+  -v --verbose          Print verbose info on the standard error
+  -n --dry-run          Do not modify puppet.conf file
+  -b --batch            Fail instead of interactive question
+  -h --help             This screen
+
+The tool uses Facter to retrieve FQDN and MAC addresses.
+
+EOUSAGE
+  exit(2)
+end
+
+def ask(question, opt = {})
+  fatal("Cannot continue, missing input: #{question}", 3) if $batch
+  if opt[:default]
+    print "#{question} [#{opt[:default]}]: "
+  else
+    print "#{question}: "
+  end
+  STDOUT.flush
+  if opt[:password]
+    system 'stty -echo' rescue nil
+  end
+  answer = STDIN.gets.chomp
+  answer = opt[:default] if opt[:default] and answer == ''
+  answer
+ensure
+  system 'stty echo' rescue nil if opt[:password]
+end
+
+$name = Facter.fqdn rescue info('Cannot determine fqdn via Facter, using hostname'); `hostname -f`.chomp
+$mac = Facter.macaddress rescue fatal('Cannot determine macaddress via Facter')
+$all_macs = Facter.list.select{|x| x =~ /^macaddress/ }.map{|x| Facter.fact(x).value }.compact.uniq
+
+loop { case ARGV[0]
+  when /^(--uri|-i)$/ then ARGV.shift; $uri = ARGV.shift
+  when /^(--username|-u)$/ then ARGV.shift; $username = ARGV.shift
+  when /^(--password|-p)$/ then ARGV.shift; $password = ARGV.shift
+  when /^(--environment|-e)$/ then ARGV.shift; $environment = ARGV.shift
+  when /^(--puppet-master|-a)$/ then ARGV.shift; $puppetmaster = ARGV.shift
+  when /^(--puppet-ca|-c)$/ then ARGV.shift; $puppetca = ARGV.shift
+  when /^(--puppet-path)$/ then ARGV.shift; $conf_path = ARGV.shift
+  when /^(--force-hostname)$/ then ARGV.shift; $name = ARGV.shift
+  when /^(--force-mac)$/ then ARGV.shift; $mac = ARGV.shift
+  when /^(--redeploy)$/ then ARGV.shift; $redeploy = true
+  when /^(--dry-run|-n)$/ then ARGV.shift; $dryrun = true
+  when /^(--verbose|-v)$/ then ARGV.shift; $verbose = true
+  when /^(--trace)$/ then ARGV.shift; $trace = true
+  when /^(--batch|-b)$/ then ARGV.shift; $batch = true
+  when /^(--help|-h)$/ then ARGV.shift; usage
+  when /^-/ then usage("Unknown option: #{ARGV[0].inspect}")
+  else break
+end; }
+
+begin
+  # ask for basic options
+  $uri = ask("Foreman URI", :default => 'http://localhost:3000') if $uri.nil?
+  $username = ask("Username", :default => 'admin') if $username.nil?
+  $password = ask("Password", :default => 'changeme') if $password.nil?
+
+  # load resources
+  api = ApipieBindings::API.new({ :uri => $uri, :username => $username, :password => $password })
+  $environments_hash = Hash[api.resource(:environments).call(:index)['results'].map{|x| [x['name'], x['id']]}]
+  info "Loaded #{$environments_hash.size} environments"
+  $puppetmasters_hash = Hash[api.resource(:smart_proxies).call(:index, :type => 'puppet')['results'].map{|x| [x['name'], x['id']]}]
+  info "Loaded #{$puppetmasters_hash.size} puppet master proxies"
+  $puppetca_hash = Hash[api.resource(:smart_proxies).call(:index, :type => 'puppetca')['results'].map{|x| [x['name'], x['id']]}]
+  info "Loaded #{$puppetca_hash.size} puppet ca proxies"
+
+  # ask for missing options
+  $environment_def = $environments_hash.first[0] if $environments_hash.count == 1
+  $environment = ask("Puppet environment", :default => $environment_def) if $environment.nil?
+  $puppetmaster_def = $puppetmasters_hash.first[0] if $puppetmasters_hash.count == 1
+  $puppetmaster = ask("Puppet master proxy", :default => $puppetmaster_def) if $puppetmaster.nil?
+  $puppetca_def = $puppetca_hash.first[0] if $puppetca_hash.count == 1
+  $puppetca = ask("Puppet ca proxy", :default => $puppetca_def) if $puppetca.nil?
+
+  # select resources
+  $environment_id = $environments_hash[$environment]
+  fatal("Environment '#{$environment}' not found") if $environment_id.nil?
+  $puppetmaster_id = $puppetmasters_hash[$puppetmaster]
+  fatal("Puppet master proxy '#{$puppetmaster}' not found") if $puppetmaster_id.nil?
+  $puppetca_id = $puppetca_hash[$puppetca]
+  fatal("Puppet ca proxy '#{$puppetca}' not found") if $puppetca_id.nil?
+
+  # register through the API
+  api.resource(:hosts).call(:create,
+                            :name => $name,
+                            :managed => false,
+                            :mac => $mac,
+                            :environment_id => $environment_id,
+                            :puppet_proxy_id => $puppetmaster_id,
+                            :puppet_ca_proxy_id => $puppetca_id) unless $redeploy
+
+  # deploy puppet.conf
+  uri = URI.parse($uri)
+  http = Net::HTTP.new(uri.host, uri.port)
+  if uri.scheme == 'https' then
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+  end
+  req = Net::HTTP::Get.new("/unattended/puppet")
+  $all_macs.each_with_index { |mac, i| req["X_RHN_PROVISIONING_MAC_#{i}"] = "ignored #{mac}" }
+  puppet_conf = http.request(req).body
+  unless $dryrun
+    FileUtils.mkdir_p(File.dirname($conf_path)) unless File.directory? File.dirname($conf_path)
+    if File.exists? $conf_path
+      FileUtils.cp $conf_path, "#{$conf_path}.backup", :preserve => true, :verbose => $verbose
+    end
+    IO.write $conf_path, puppet_conf
+    info "Writing #{$conf_path}:"
+  else
+    info "Skipped #{$conf_path} deployment"
+  end
+  info puppet_conf
+
+rescue RestClient::Exception => e
+  begin
+    if JSON.parse(e.http_body)['error']['full_messages']
+      message = JSON.parse(e.http_body)['error']['full_messages'].join("\n")
+    else
+      message = JSON.parse(e.http_body)['error']['message']
+    end
+  rescue
+    message = e.to_s
+  end
+  $stderr.puts(message)
+  if $trace
+    raise e
+  else
+    fatal("There was an error during registration", 1)
+  end
+rescue Exception => e
+  $stderr.puts(e)
+  if $trace
+    raise e
+  else
+    fatal("There was an error during registration", 1)
+  end
+end
